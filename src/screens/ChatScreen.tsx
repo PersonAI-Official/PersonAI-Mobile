@@ -1,4 +1,5 @@
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+import { useFocusEffect } from "@react-navigation/native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   FlatList,
@@ -36,6 +37,7 @@ import {
   steerChatMessage,
   stopChatRun,
   uploadChatAttachment,
+  watchChatEvents,
   type ChatAttachment,
   type ChatMessage,
   type ChatSession,
@@ -43,7 +45,11 @@ import {
   type ModelSelectOption,
   type ReasoningEffort,
 } from "../api/tron";
-import type { AgUiEvent } from "../api/rpc";
+import {
+  SESSION_RPC_METHODS,
+  supportsMethod,
+  type AgUiEvent,
+} from "../api/rpc";
 import { AppHeader } from "../components/AppHeader";
 import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
@@ -70,11 +76,14 @@ import {
 } from "@personai/agent-ui-chat-react-native";
 import {
   ChatA2uiSession,
+  activeChatReplayPendingTurnMaxAgeMs,
   batchApprovalDecisions,
   buildAguiRunNotices,
   interactionMessages,
+  mergeChatMessagesChronologically,
   nativeUserInputBatchAnswer,
   nativeUserInputRequests,
+  openAguiProtocolRunCodes,
   pendingApprovalRequests,
   type AguiRunNotice,
   type ChatA2uiActionHandler,
@@ -138,6 +147,69 @@ function eventRunId(event: AgUiEvent): string | null {
     ? event.runId
     : null;
 }
+
+/**
+ * The run this screen is following without having started it. `startedAt` keeps
+ * the identity stable across re-reads while the node reports the same run, and
+ * `trace` seeds the live work rail from what the replay already knows.
+ */
+interface OpenRun {
+  runId: string;
+  startedAt: number;
+  trace: RunTrace | null;
+}
+
+/** `CUSTOM` event name that carries A2UI surface updates. */
+const A2UI_EVENT_NAME = "agent.a2ui";
+
+/** The stream event shape `ChatA2uiSession.applyEvent` accepts. */
+type AguiStreamEventForA2ui = Parameters<ChatA2uiSession["applyEvent"]>[0];
+
+function isTerminalRunEvent(event: AgUiEvent): boolean {
+  const type = (event.type ?? "").toUpperCase();
+  return type === "RUN_FINISHED" || type === "RUN_ERROR";
+}
+
+/**
+ * The run the node is still working on, from its protocol replay.
+ *
+ * `openAguiProtocolRunCodes` reports every run without a terminal event, which
+ * also includes runs whose client died mid-flight; the newest one inside the
+ * pending-turn window is the only one worth following.
+ */
+function findOpenRun(
+  events: AgUiEvent[],
+  runOrder: string[],
+  traces: Map<string, RunTrace>,
+  sessionCode: string,
+): OpenRun | null {
+  const openCodes = openAguiProtocolRunCodes(
+    events as unknown as TranscriptAguiEvent[],
+    sessionCode,
+  );
+  if (!openCodes.size) return null;
+  for (let index = runOrder.length - 1; index >= 0; index -= 1) {
+    const runId = runOrder[index];
+    if (!runId || !openCodes.has(runId)) continue;
+    const trace = traces.get(runId) ?? null;
+    const startedAt = trace?.startedAt ?? Date.now();
+    if (Date.now() - startedAt > activeChatReplayPendingTurnMaxAgeMs) return null;
+    return { runId, startedAt, trace };
+  }
+  return null;
+}
+
+/**
+ * `session.watchEvents` is followed tail-only: the screen reads the filtered
+ * protocol replay for history, so the subscription only has to report what
+ * happens from now on. Durable re-reads are coalesced to one per beat because a
+ * busy run streams events far faster than the transcript needs to repaint.
+ */
+const RESUME_REFRESH_MIN_MS = 1_200;
+/** Re-read cadence while the event subscription is healthy. */
+const RESUME_KEEPALIVE_MS = 10_000;
+/** Re-read cadence when the node offers no usable subscription. */
+const RESUME_POLL_MS = 2_500;
 
 function toAgentMessage(
   message: ChatMessage,
@@ -289,6 +361,7 @@ export function ChatScreen({ navigation, route }: Props) {
     error: sessionError,
     contentEpoch,
     currentNode,
+    methods,
     request: sessionRequest,
     reportRequestError,
     probeNow,
@@ -392,10 +465,56 @@ export function ChatScreen({ navigation, route }: Props) {
   const [answeredRequests, setAnsweredRequests] = useState<ChatUserInputRequest[]>([]);
   const [answering, setAnswering] = useState(false);
   const [a2uiRevision, setA2uiRevision] = useState(0);
+  /**
+   * A run the node is still working on. Re-opening a session whose protocol
+   * replay has no terminal event must resume the live view instead of freezing
+   * on the last persisted message.
+   */
+  const [openRun, setOpenRun] = useState<OpenRun | null>(null);
+  /**
+   * An answer or A2UI action was submitted, so the node is about to continue a
+   * run this screen is not streaming itself. `runId` is the best-known id of that
+   * run (empty until the resume actually announces one).
+   *
+   * `tron.chat.answerUserInput` and `tron.chat.a2uiAction` are one-shot calls that
+   * internally collect the whole resumed run and answer only when it ends, so
+   * without following the session stream the screen would sit with no progress
+   * for the entire continuation - and lose it for good once the call deadline
+   * passes.
+   */
+  const [adoptRun, setAdoptRun] = useState<{ runId: string | null } | null>(
+    null,
+  );
+  /** Whether the node proved it took the submitted answer by resuming. */
+  const answerResumedRef = useRef(false);
+  /**
+   * Why this screen is following a run: `replay` found one already working when
+   * the session was opened, `submit` is the continuation of an answer or card
+   * action this user just sent. Only the first may be ended by a replay that no
+   * longer reports an open run - right after a submit the paused run still
+   * carries its interrupt's terminal event, so the replay briefly says "no run".
+   */
+  const followSourceRef = useRef<"replay" | "submit">("submit");
 
   const listRef = useRef<FlatList<AgentChatMessage>>(null);
   const messagesSeqRef = useRef(0);
   const streamControllerRef = useRef<AbortController | null>(null);
+  /** `session.watchEvents` of a run this screen did not start itself. */
+  const resumeControllerRef = useRef<AbortController | null>(null);
+  /** The run whose live view this screen is holding, if any. */
+  const resumedRunIdRef = useRef<string | null>(null);
+  /**
+   * The tail of the followed run accumulated so far. A re-attach (new tunnel,
+   * node switch) continues it instead of restarting the reply from nothing.
+   */
+  const resumeTailRef = useRef<{
+    runId: string | null;
+    text: string;
+  } | null>(null);
+  /** Lets the protocol re-read release a followed run it proves is over. */
+  const settleResumedRunRef = useRef<() => void>(() => undefined);
+  /** Coalesces the durable re-reads the resumed stream asks for. */
+  const resumeRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
   const activeSessionRef = useRef(sessionCode);
   /** Latest real session code; promotion must be visible inside one async send. */
@@ -417,6 +536,8 @@ export function ChatScreen({ navigation, route }: Props) {
   const conversationGenerationRef = useRef(0);
   /** Guards the one reload per online transition. */
   const onlineLoadedRef = useRef(false);
+  /** Whether the current conversation has had its post-mount focus refresh. */
+  const focusLoadedRef = useRef(false);
   const queuedRef = useRef<QueuedChatMessage[]>([]);
   const a2uiSession = useMemo(() => new ChatA2uiSession(sessionCode), [sessionCode]);
   const a2uiSessionRef = useRef(a2uiSession);
@@ -440,6 +561,21 @@ export function ChatScreen({ navigation, route }: Props) {
   const hasRunNotices =
     Boolean(liveRunNotices) ||
     replayRunNotices.some((entry) => entry.notices.length > 0);
+  /**
+   * The session is busy: this screen is streaming a run of its own, or the node
+   * is still working on one it only follows. Both lock the composer and keep the
+   * live work rail on screen.
+   */
+  const runActive = sending || Boolean(openRun) || Boolean(adoptRun);
+  /**
+   * The run whose live view this screen holds: one the node was already working
+   * on when the session was opened, or the continuation a submitted answer or
+   * A2UI action is about to start. The id is null for the second case until the
+   * node announces it, because a resume may either reuse the paused run's id or
+   * mint a new one. `trace` seeds the work rail from what the replay knows.
+   */
+  const followRunId = openRun?.runId ?? adoptRun?.runId ?? null;
+  const followTrace = openRun?.trace ?? null;
 
   // A session opened from the dashboard carries no label; read it once per node
   // so the header always names the workspace the session lives in.
@@ -645,8 +781,9 @@ export function ChatScreen({ navigation, route }: Props) {
               (event) =>
                 event.type === "RUN_FINISHED" || event.type === "RUN_ERROR",
             );
+            const built = buildRunTraces(events);
             setTraces((previous) => {
-              const next = buildRunTraces(events);
+              const next = new Map(built);
               // A run that just finished may not be in the node's replay yet;
               // keep the trace collected live instead of dropping it.
               for (const [runId, trace] of previous) {
@@ -686,6 +823,33 @@ export function ChatScreen({ navigation, route }: Props) {
             // A waiting run may not have a terminal replay event yet; keep the
             // requests loaded from the durable interaction history.
             if (terminal || requests.length) setPendingRequests(requests);
+            // A run whose replay has no terminal event is still working on the
+            // node. Track it so the screen keeps a live view of it instead of
+            // stopping at the last persisted message. This client's own send
+            // already streams the run, so it must not be watched twice.
+            if (!streamControllerRef.current) {
+              const open = findOpenRun(
+                events,
+                runOrder,
+                built,
+                targetSessionCode,
+              );
+              // The identity stays while the node reports the same open run, so a
+              // re-read never restarts the follow effect.
+              setOpenRun((previous) =>
+                open && previous?.runId === open.runId ? previous : open,
+              );
+              if (
+                !open &&
+                resumedRunIdRef.current &&
+                followSourceRef.current === "replay"
+              ) {
+                // Nothing delivered the terminal event (the node has no
+                // subscription, or it dropped): the replay proves the run is
+                // over, so the followed view has to be released here.
+                settleResumedRunRef.current();
+              }
+            }
           }
         })
         .catch(() => undefined);
@@ -710,8 +874,9 @@ export function ChatScreen({ navigation, route }: Props) {
         { retry: false },
       );
       if (!state || !mountedRef.current) return;
+      // Hydrating notifies the client, and the client subscription repaints the
+      // rows that own those surfaces.
       a2uiSessionRef.current.hydrate(state as unknown as ChatA2uiState);
-      setA2uiRevision((value) => value + 1);
     } catch {
       // Older nodes do not expose A2UI state; display-only surfaces still work.
     }
@@ -722,6 +887,109 @@ export function ChatScreen({ navigation, route }: Props) {
     sessionStatus,
     workspaceCode,
   ]);
+
+  /**
+   * Fold one AG-UI event into the live view. The stream of a message this screen
+   * sent and the `session.watchEvents` tail of a run started elsewhere both feed
+   * it, so the work rail, lifecycle notices, A2UI surfaces and ask-user cards
+   * look the same whichever client started the run.
+   */
+  const observeLiveEvent = useCallback(
+    (event: AgUiEvent) => {
+      if (!mountedRef.current) return;
+      const activeCode = sessionCodeRef.current;
+      const type = (event.type ?? "").toUpperCase();
+      // Only lifecycle/custom events feed the notice builder; text and tool
+      // deltas would just grow the buffer for a long run.
+      if (
+        type === "RUN_STARTED" ||
+        type === "RUN_FINISHED" ||
+        type === "RUN_ERROR" ||
+        type === "CUSTOM"
+      ) {
+        runEventsRef.current.push(event);
+      }
+      if (type === "RUN_STARTED") {
+        setActiveRunId(eventRunId(event));
+        setPendingRequests([]);
+      } else if (type === "RUN_FINISHED") {
+        setActiveRunId(null);
+        const requests = nativeUserInputRequests(
+          [event as Parameters<typeof nativeUserInputRequests>[0][number]],
+          activeCode,
+        ).filter(
+          (request) => !answeredRequestIdsRef.current.has(request.requestId),
+        );
+        setPendingRequests(requests);
+        void refreshA2uiState();
+      } else if (type === "RUN_ERROR") {
+        setActiveRunId(null);
+        setPendingRequests([]);
+      }
+      // Same notice vocabulary as the web chat rail: a failed or stopped run is
+      // reported from its AG-UI events, not invented per client. Recompute on
+      // the run's terminal event.
+      if (isTerminalRunEvent(event)) {
+        const runId = eventRunId(event) ?? liveTraceRef.current?.runId ?? null;
+        const notices = runId
+          ? buildAguiRunNotices(
+              runEventsRef.current as unknown as TranscriptAguiEvent[],
+            )
+          : [];
+        if (runId && notices.length) {
+          setLiveRunNotices({ runId, notices });
+        }
+      }
+      // Surfaces travel as `CUSTOM agent.a2ui`. The runtime keeps its own
+      // revision counter, so a rejected event means the stream missed one and
+      // the canonical state has to be re-read.
+      if (type === "CUSTOM" && event.name === A2UI_EVENT_NAME) {
+        if (
+          !a2uiSessionRef.current.applyEvent(
+            event as unknown as AguiStreamEventForA2ui,
+          )
+        ) {
+          void refreshA2uiState();
+        }
+      }
+      const nextTrace = reduceRunTrace(liveTraceRef.current, event);
+      if (nextTrace !== liveTraceRef.current) {
+        liveTraceRef.current = nextTrace;
+        setLiveTrace(nextTrace);
+      }
+    },
+    [refreshA2uiState],
+  );
+
+  /** Re-read what the resumed run has produced so far (traces, surfaces). */
+  const refreshResumedRun = useCallback(() => {
+    if (!mountedRef.current) return;
+    refreshProtocolEvents(messagesSeqRef.current);
+    void refreshA2uiState();
+  }, [refreshA2uiState, refreshProtocolEvents]);
+
+  /**
+   * Durable re-reads of the followed run, coalesced: a busy run streams events
+   * far faster than the transcript needs to repaint, and each re-read asks the
+   * node for its whole filtered replay.
+   */
+  const scheduleResumedRefresh = useCallback(
+    (trailing: boolean) => {
+      if (resumeRefreshRef.current) {
+        if (!trailing) return;
+        clearTimeout(resumeRefreshRef.current);
+        resumeRefreshRef.current = null;
+        refreshResumedRun();
+        return;
+      }
+      const timer = setTimeout(() => {
+        resumeRefreshRef.current = null;
+        refreshResumedRun();
+      }, RESUME_REFRESH_MIN_MS);
+      resumeRefreshRef.current = timer;
+    },
+    [refreshResumedRun],
+  );
 
   const readClipboardFile = useCallback(async (): Promise<ComposerClipboardFile | null> => {
     const image = await Clipboard.getImageAsync({ format: "png" });
@@ -986,8 +1254,23 @@ export function ChatScreen({ navigation, route }: Props) {
     resetKeyRef.current = resetKey;
     conversationGenerationRef.current += 1;
     onlineLoadedRef.current = false;
+    focusLoadedRef.current = false;
     streamControllerRef.current?.abort();
     streamControllerRef.current = null;
+    // The followed run belongs to the conversation being left; its subscription
+    // and any re-read timer must not leak into the next one.
+    resumeControllerRef.current?.abort();
+    resumeControllerRef.current = null;
+    resumedRunIdRef.current = null;
+    resumeTailRef.current = null;
+    answerResumedRef.current = false;
+    settleResumedRunRef.current = () => undefined;
+    setAdoptRun(null);
+    if (resumeRefreshRef.current) {
+      clearTimeout(resumeRefreshRef.current);
+      resumeRefreshRef.current = null;
+    }
+    setOpenRun(null);
     messagesSeqRef.current += 1;
     sendingRef.current = false;
     setSending(false);
@@ -1050,6 +1333,17 @@ export function ChatScreen({ navigation, route }: Props) {
     a2uiSessionRef.current = a2uiSession;
   }, [a2uiSession]);
 
+  // Surfaces reach the runtime from the canonical read and from `agent.a2ui`
+  // events; every change has to re-derive the transcript rows they own, or a new
+  // card would only show up after the next unrelated repaint.
+  useEffect(
+    () =>
+      a2uiSession.client.subscribe(() =>
+        setA2uiRevision((value) => value + 1),
+      ),
+    [a2uiSession],
+  );
+
   // Reconnects reload the transcript in place instead of clearing it.
   useEffect(() => {
     if (sessionStatus !== "online") {
@@ -1060,6 +1354,26 @@ export function ChatScreen({ navigation, route }: Props) {
     onlineLoadedRef.current = true;
     void loadMessages(true);
   }, [loadMessages, sessionStatus]);
+
+  // A screen the navigator kept mounted has to catch up when it comes back: the
+  // node may have finished a turn, published a surface, or started a run while
+  // another page had focus.
+  useFocusEffect(
+    useCallback(() => {
+      if (
+        !sessionCodeRef.current ||
+        sessionStatusRef.current !== "online" ||
+        streamControllerRef.current
+      ) {
+        return;
+      }
+      if (!focusLoadedRef.current) {
+        focusLoadedRef.current = true;
+        return;
+      }
+      void loadMessages(false);
+    }, [loadMessages]),
+  );
 
   const reloadMessages = useCallback(
     async (options: { clearError?: boolean } = {}): Promise<ChatMessage[] | null> => {
@@ -1099,6 +1413,218 @@ export function ChatScreen({ navigation, route }: Props) {
     workspaceCode,
   ]);
 
+  /**
+   * Inputs this screen queued go next once the session is idle again, whether
+   * the run ended on this screen's own stream or on one it only followed.
+   */
+  const drainQueuedInput = useCallback(() => {
+    if (
+      !mountedRef.current ||
+      sendingRef.current ||
+      sessionStatusRef.current !== "online" ||
+      pendingRequestsRef.current.length
+    ) {
+      return;
+    }
+    const [next, ...rest] = queuedRef.current;
+    if (!next) return;
+    queuedRef.current = rest;
+    setQueued(rest);
+    setTimeout(() => void runMessageRef.current(next.content), 50);
+  }, []);
+
+  /** Drop the followed view and give the composer back to the user. */
+  const releaseFollow = useCallback(() => {
+    resumedRunIdRef.current = null;
+    resumeTailRef.current = null;
+    answerResumedRef.current = false;
+    followSourceRef.current = "submit";
+    sendingRef.current = false;
+    setSending(false);
+    setAdoptRun(null);
+    setOpenRun(null);
+    setAnswering(false);
+    setActiveRunId(null);
+    setStreamText("");
+    setLiveTrace(null);
+    liveTraceRef.current = null;
+    runEventsRef.current = [];
+  }, []);
+
+  /**
+   * The node finished a run this screen was only following: read the committed
+   * reply back and hand the composer over.
+   */
+  const settleResumedRun = useCallback(() => {
+    if (!mountedRef.current) return;
+    releaseFollow();
+    void reloadMessages();
+    void refreshA2uiState();
+    drainQueuedInput();
+  }, [drainQueuedInput, refreshA2uiState, reloadMessages, releaseFollow]);
+
+  /**
+   * Release the followed view for the paths that already re-read the durable
+   * views themselves: the answer and A2UI action calls return the resumed run's
+   * events, so their completion means the node's run is over.
+   */
+  const settleFollow = useCallback(() => {
+    if (!mountedRef.current) return;
+    // A call that answers late must not tear down the view of a newer run this
+    // screen started in the meantime.
+    if (streamControllerRef.current) return;
+    releaseFollow();
+    drainQueuedInput();
+  }, [drainQueuedInput, releaseFollow]);
+
+  useEffect(() => {
+    settleResumedRunRef.current = settleResumedRun;
+  }, [settleResumedRun]);
+
+  // A run the node is working on has to stay live: across a visit to another
+  // page, and across the answer that resumes a paused one. This screen attaches
+  // with `session.watchEvents` (tail only: the filtered replay it already reads
+  // is the cheaper history) and keeps a slow re-read of the durable views as the
+  // safety net, which is also what proves the run ended when no subscription
+  // survived.
+  useEffect(() => {
+    const runId = followRunId;
+    if (!runId && !adoptRun) return;
+    if (!sessionCode || sessionStatus !== "online") return;
+    // The session is busy for this screen: steer and queue are offered, a second
+    // concurrent run is not.
+    followSourceRef.current = openRun ? "replay" : "submit";
+    resumedRunIdRef.current = runId;
+    sendingRef.current = true;
+    setSending(true);
+    if (runId) setActiveRunId(runId);
+    const tail =
+      resumeTailRef.current && resumeTailRef.current.runId === runId
+        ? resumeTailRef.current
+        : { runId, text: "" };
+    resumeTailRef.current = tail;
+    setStreamText(tail.text);
+    // Seed the rail with what the replay already knows; live events extend it.
+    if (liveTraceRef.current?.runId !== runId) {
+      liveTraceRef.current = runId ? followTrace : null;
+      setLiveTrace(liveTraceRef.current);
+    }
+    runEventsRef.current = [];
+    let stopped = false;
+    let target = runId;
+    let watchLive = false;
+    let poll: ReturnType<typeof setTimeout> | null = null;
+    let watch: AbortController | null = null;
+    const stopPoll = () => {
+      if (!poll) return;
+      clearTimeout(poll);
+      poll = null;
+    };
+    const reschedule = () => {
+      stopPoll();
+      poll = setTimeout(tick, watchLive ? RESUME_KEEPALIVE_MS : RESUME_POLL_MS);
+    };
+    function tick() {
+      if (stopped) return;
+      refreshResumedRun();
+      reschedule();
+    }
+    const onEvent = (event: AgUiEvent) => {
+      if (stopped) return;
+      const type = (event.type ?? "").toUpperCase();
+      const eventRun = eventRunId(event);
+      // A resume announces its run with `RUN_STARTED`. This screen submitted the
+      // answer, so the next run that starts here IS the continuation - it may
+      // reuse the paused run's id or mint a new one, and the seed taken from the
+      // request is only a guess until that event says otherwise.
+      if (type === "RUN_STARTED" && eventRun && (!openRun || !target)) {
+        target = eventRun;
+        resumedRunIdRef.current = eventRun;
+        tail.runId = eventRun;
+        setActiveRunId(eventRun);
+      }
+      if (target && eventRun && eventRun !== target) return;
+      // Rail, notices, ask-user cards and surfaces, with the same handling a run
+      // started on this screen gets.
+      observeLiveEvent(event);
+      answerResumedRef.current = true;
+      if (isTerminalRunEvent(event) && (!eventRun || eventRun === target)) {
+        stopped = true;
+        settleResumedRun();
+        return;
+      }
+      // The tail is text this client has not seen yet: the committed reply
+      // replaces it once the run finishes.
+      if (type === "TEXT_MESSAGE_CONTENT" && eventRun === target) {
+        const delta = typeof event.delta === "string" ? event.delta : "";
+        if (delta) {
+          tail.text += delta;
+          setStreamText(tail.text);
+        }
+      }
+    };
+    const attach = () => {
+      if (stopped) return;
+      if (!supportsMethod(methods, SESSION_RPC_METHODS.watchEvents)) {
+        // A product without an event bus may not implement the subscription at
+        // all; the durable replay alone keeps this screen current.
+        watchLive = false;
+        reschedule();
+        return;
+      }
+      const controller = new AbortController();
+      watch = controller;
+      resumeControllerRef.current = controller;
+      const lost = () => {
+        if (!watchLive || stopped) return;
+        // The node closed the subscription, or it never worked: re-read now and
+        // keep the transcript honest on the faster fallback cadence.
+        watchLive = false;
+        reschedule();
+        scheduleResumedRefresh(true);
+      };
+      void sessionRequest(
+        ({ tunnel }) =>
+          watchChatEvents({
+            tunnel,
+            sessionCode,
+            tailOnly: true,
+            signal: controller.signal,
+            onEvent,
+          }),
+        { retry: false },
+      ).then(lost, lost);
+    };
+    watchLive = true;
+    attach();
+    reschedule();
+    return () => {
+      stopped = true;
+      stopPoll();
+      watch?.abort();
+      if (watch && resumeControllerRef.current === watch) {
+        resumeControllerRef.current = null;
+      }
+      if (resumeRefreshRef.current) {
+        clearTimeout(resumeRefreshRef.current);
+        resumeRefreshRef.current = null;
+      }
+    };
+  }, [
+    adoptRun,
+    followRunId,
+    followTrace,
+    methods,
+    openRun,
+    observeLiveEvent,
+    refreshResumedRun,
+    scheduleResumedRefresh,
+    sessionCode,
+    sessionRequest,
+    sessionStatus,
+    settleResumedRun,
+  ]);
+
   const scrollToBottom = useCallback((animated: boolean) => {
     listRef.current?.scrollToEnd({ animated });
   }, []);
@@ -1107,12 +1633,23 @@ export function ChatScreen({ navigation, route }: Props) {
   // content-size callback, which used to leave the transcript parked above the
   // newest turn. One short deferred scroll settles it on the real bottom.
   useEffect(() => {
-    if (!messages.length && !sending && !pendingRequests.length && !hasRunNotices) {
+    if (
+      !messages.length &&
+      !runActive &&
+      !pendingRequests.length &&
+      !hasRunNotices
+    ) {
       return;
     }
     const timer = setTimeout(() => scrollToBottom(false), 120);
     return () => clearTimeout(timer);
-  }, [hasRunNotices, messages, pendingRequests.length, scrollToBottom, sending]);
+  }, [
+    hasRunNotices,
+    messages,
+    pendingRequests.length,
+    runActive,
+    scrollToBottom,
+  ]);
 
   useEffect(() => {
     const subscription = Keyboard.addListener(
@@ -1150,6 +1687,11 @@ export function ChatScreen({ navigation, route }: Props) {
       runEventsRef.current = [];
       setLiveRunNotices(null);
       setActiveRunId(null);
+      // This client now owns the run; the followed-run subscription would only
+      // duplicate the stream it is already reading.
+      setOpenRun(null);
+      resumedRunIdRef.current = null;
+      resumeTailRef.current = null;
 
       const optimisticId = `local-${Date.now()}`;
       const optimistic: ChatMessage = {
@@ -1192,64 +1734,7 @@ export function ChatScreen({ navigation, route }: Props) {
                 accumulated += delta;
                 if (mountedRef.current) setStreamText(accumulated);
               },
-              onEvent: (event) => {
-                if (!mountedRef.current) return;
-                const type = (event.type ?? "").toUpperCase();
-                // Only lifecycle/custom events feed the notice builder; text
-                // and tool deltas would just grow the buffer for a long run.
-                if (
-                  type === "RUN_STARTED" ||
-                  type === "RUN_FINISHED" ||
-                  type === "RUN_ERROR" ||
-                  type === "CUSTOM"
-                ) {
-                  runEventsRef.current.push(event);
-                }
-                if (type === "RUN_STARTED") {
-                  setActiveRunId(
-                    typeof event.runId === "string" ? event.runId : null,
-                  );
-                  setPendingRequests([]);
-                } else if (type === "RUN_FINISHED") {
-                  setActiveRunId(null);
-                  const requests = nativeUserInputRequests(
-                    [event as Parameters<typeof nativeUserInputRequests>[0][number]],
-                    activeCode,
-                  ).filter(
-                    (request) =>
-                      !answeredRequestIdsRef.current.has(request.requestId),
-                  );
-                  setPendingRequests(requests);
-                  void refreshA2uiState();
-                } else if (type === "RUN_ERROR") {
-                  setActiveRunId(null);
-                  setPendingRequests([]);
-                }
-                // Same notice vocabulary as the web chat rail: a failed or
-                // stopped run is reported from its AG-UI events, not invented
-                // per client. Recompute on the run's terminal event.
-                if (type === "RUN_ERROR" || type === "RUN_FINISHED") {
-                  const runId =
-                    eventRunId(event) ?? liveTraceRef.current?.runId ?? null;
-                  const notices = runId
-                    ? buildAguiRunNotices(
-                        runEventsRef.current as unknown as TranscriptAguiEvent[],
-                      )
-                    : [];
-                  if (runId && notices.length) {
-                    const next = { runId, notices };
-                    setLiveRunNotices(next);
-                  }
-                }
-                const nextTrace = reduceRunTrace(
-                  liveTraceRef.current,
-                  event,
-                );
-                if (nextTrace !== liveTraceRef.current) {
-                  liveTraceRef.current = nextTrace;
-                  setLiveTrace(nextTrace);
-                }
-              },
+              onEvent: observeLiveEvent,
             }),
           { retry: false },
         );
@@ -1348,25 +1833,14 @@ export function ChatScreen({ navigation, route }: Props) {
           setSending(false);
           setStreamText("");
         }
-        if (
-          mountedRef.current &&
-          !controller.signal.aborted &&
-          sessionStatusRef.current === "online" &&
-          pendingRequestsRef.current.length === 0
-        ) {
-          const [nextQueued, ...rest] = queuedRef.current;
-          if (nextQueued) {
-            queuedRef.current = rest;
-            setQueued(rest);
-            setTimeout(() => void runMessageRef.current(nextQueued.content), 50);
-          }
-        }
+        if (!controller.signal.aborted) drainQueuedInput();
       }
     },
     [
+      drainQueuedInput,
       effectiveAssistantCode,
+      observeLiveEvent,
       reasoningEffort,
-      refreshA2uiState,
       reloadMessages,
       reportRequestError,
       selectedModelOption,
@@ -1708,6 +2182,14 @@ export function ChatScreen({ navigation, route }: Props) {
       setPendingRequests((previous) =>
         previous.filter((item) => !answeredIds.has(item.requestId)),
       );
+      // The answer call only returns when the resumed run ends, so the live view
+      // has to come from the session stream instead: adopt the continuation now
+      // and let its terminal event commit the transcript.
+      answerResumedRef.current = false;
+      setStreamText("");
+      setLiveTrace(null);
+      liveTraceRef.current = null;
+      setAdoptRun({ runId: request.runId?.trim() || null });
       try {
         const events = await sessionRequest(
           ({ tunnel }) =>
@@ -1736,17 +2218,32 @@ export function ChatScreen({ navigation, route }: Props) {
         ]);
         await reloadMessages();
         void refreshA2uiState();
+        // The run ended with this call; the subscription needs no longer hold.
+        settleFollow();
       } catch (answerError) {
-        answeredIds.forEach((id) => answeredRequestIdsRef.current.delete(id));
-        setPendingRequests((previous) => [
-          ...requests.filter(
-            (item) => !previous.some((entry) => entry.requestId === item.requestId),
-          ),
-          ...previous,
-        ]);
-        if (!isAbortError(answerError)) {
-          reportRequestError(answerError);
-          setError(describeError(answerError));
+        if (answerResumedRef.current || followSourceRef.current === "replay") {
+          // The node took the answer and resumed; the one-shot call merely
+          // stopped waiting. Restoring the card here would offer an answer that
+          // is already spent, so re-read the durable views instead.
+          await reloadMessages({ clearError: false });
+          void refreshA2uiState();
+          settleFollow();
+        } else {
+          answeredIds.forEach((id) =>
+            answeredRequestIdsRef.current.delete(id),
+          );
+          setPendingRequests((previous) => [
+            ...requests.filter(
+              (item) =>
+                !previous.some((entry) => entry.requestId === item.requestId),
+            ),
+            ...previous,
+          ]);
+          setAdoptRun(null);
+          if (!isAbortError(answerError)) {
+            reportRequestError(answerError);
+            setError(describeError(answerError));
+          }
         }
       } finally {
         if (mountedRef.current) setAnswering(false);
@@ -1762,6 +2259,7 @@ export function ChatScreen({ navigation, route }: Props) {
       reportRequestError,
       sessionCode,
       sessionRequest,
+      settleFollow,
       workspaceCode,
     ],
   );
@@ -1772,6 +2270,14 @@ export function ChatScreen({ navigation, route }: Props) {
       if (!surface || a2uiBusyRef.current) return;
       a2uiBusyRef.current = true;
       const actionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      // Like the ask-user answer, this call only returns when the run the action
+      // resumed is over: follow the session stream so the card shows progress and
+      // commits itself instead of waiting on this call.
+      answerResumedRef.current = false;
+      setStreamText("");
+      setLiveTrace(null);
+      liveTraceRef.current = null;
+      setAdoptRun({ runId: surface.runId?.trim() || null });
       void (async () => {
         try {
           const events = await sessionRequest(
@@ -1793,10 +2299,18 @@ export function ChatScreen({ navigation, route }: Props) {
           applyInteractionEvents(events);
           await reloadMessages();
           void refreshA2uiState();
+          settleFollow();
         } catch (actionError) {
-          if (!isAbortError(actionError)) {
-            reportRequestError(actionError);
-            setError(describeError(actionError));
+          if (answerResumedRef.current || followSourceRef.current === "replay") {
+            await reloadMessages({ clearError: false });
+            void refreshA2uiState();
+            settleFollow();
+          } else {
+            setAdoptRun(null);
+            if (!isAbortError(actionError)) {
+              reportRequestError(actionError);
+              setError(describeError(actionError));
+            }
           }
         } finally {
           a2uiBusyRef.current = false;
@@ -1811,6 +2325,7 @@ export function ChatScreen({ navigation, route }: Props) {
       reportRequestError,
       sessionCode,
       sessionRequest,
+      settleFollow,
       workspaceCode,
     ],
   );
@@ -2010,12 +2525,26 @@ export function ChatScreen({ navigation, route }: Props) {
   const transcriptMessages = useMemo(
     () =>
       interactionMessages(
-        agentMessages,
+        // A2UI surfaces are the session's own state, not a field the node
+        // persists on a message row, so they have to be merged back in. Without
+        // this a card only exists while the client that received it stays on
+        // screen, and every reload drops it.
+        mergeChatMessagesChronologically(
+          agentMessages,
+          a2uiSession.messages(),
+        ),
         [...pendingRequests, ...answeredRequests],
         undefined,
         userInputLabels,
       ),
-    [agentMessages, answeredRequests, pendingRequests, userInputLabels],
+    [
+      a2uiRevision,
+      a2uiSession,
+      agentMessages,
+      answeredRequests,
+      pendingRequests,
+      userInputLabels,
+    ],
   );
 
   const horizontalPadding = 20;
@@ -2024,26 +2553,33 @@ export function ChatScreen({ navigation, route }: Props) {
   const disconnected = offline || unauthorized;
   const canSend =
     (Boolean(input.trim()) || pendingAttachments.length > 0) &&
-    !sending &&
+    !runActive &&
     !creatingSession &&
     !answering &&
     pendingRequests.length === 0 &&
     !loading &&
     sessionStatus === "online";
-  const canSteer = Boolean(input.trim()) && sending && Boolean(activeRunId);
-  const canQueue = Boolean(input.trim()) && sending;
+  const canSteer = Boolean(input.trim()) && runActive && Boolean(activeRunId);
+  const canQueue = Boolean(input.trim()) && runActive;
 
   // A run can produce more than one assistant message (steer/resume). Render
   // its process above the final message only, instead of repeating the tools.
+  // The run this screen is following is excluded: its rail belongs to the live
+  // tail at the end of the transcript, where a surface published mid-run would
+  // otherwise duplicate it.
   const traceOwnerByRun = useMemo(() => {
     const owners = new Map<string, string>();
     for (const message of transcriptMessages) {
-      if (message.role === "ASSISTANT" && message.runId) {
+      if (
+        message.role === "ASSISTANT" &&
+        message.runId &&
+        message.runId !== followRunId
+      ) {
         owners.set(message.runId, message.messageId);
       }
     }
     return owners;
-  }, [transcriptMessages]);
+  }, [followRunId, transcriptMessages]);
 
   // The work rail of the newest turn. A failed run usually has no assistant
   // message to own it (the node never persists one), so its notice belongs at
@@ -2062,6 +2598,28 @@ export function ChatScreen({ navigation, route }: Props) {
   const footerRunTrace = footerRunNotices
     ? traces.get(footerRunNotices.runId) ?? null
     : null;
+  /**
+   * The rail of the busy run. A followed run is seeded from the node's replay and
+   * extended by the subscription; whichever side knows more of the run's work
+   * wins, so a gap between the two reads heals on the next one.
+   */
+  const resumedTrace = followRunId ? traces.get(followRunId) ?? null : null;
+  const liveRunTrace = followRunId
+    ? resumedTrace &&
+      (!liveTrace ||
+        liveTrace.runId !== followRunId ||
+        resumedTrace.tools.length >= liveTrace.tools.length)
+      ? resumedTrace
+      : liveTrace
+    : liveTrace;
+  const liveRunRailNotices = followRunId
+    ? noticesByRun.get(followRunId) ??
+      (liveRunNotices?.runId === followRunId
+        ? liveRunNotices.notices
+        : undefined)
+    : liveRunTrace && liveRunNotices?.runId === liveRunTrace.runId
+      ? liveRunNotices.notices
+      : undefined;
 
   return (
     <Screen padded={false}>
@@ -2222,7 +2780,6 @@ export function ChatScreen({ navigation, route }: Props) {
                         </View>
                       ) : null}
                       <AgentMessageBubble
-                        key={`${item.messageId}:${a2uiRevision}`}
                         message={item}
                         onA2UIAction={handleA2UIAction}
                         runtime={a2uiSession}
@@ -2262,20 +2819,16 @@ export function ChatScreen({ navigation, route }: Props) {
                   )
                 }
                 ListFooterComponent={
-                  sending || pendingRequests.length || footerRunNotices ? (
+                  runActive || pendingRequests.length || footerRunNotices ? (
                     <View>
-                      {sending ? (
+                      {runActive ? (
                         <>
-                          {liveTrace ? (
+                          {liveRunTrace ? (
                             <RunProcess
-                              trace={liveTrace}
+                              trace={liveRunTrace}
                               live
                               noticeLabels={runNoticeLabels}
-                              notices={
-                                liveRunNotices?.runId === liveTrace.runId
-                                  ? liveRunNotices.notices
-                                  : undefined
-                              }
+                              notices={liveRunRailNotices}
                             />
                           ) : null}
                           <LocalMessageBubble
@@ -2296,7 +2849,7 @@ export function ChatScreen({ navigation, route }: Props) {
                           theme={agentTheme}
                         />
                       ))}
-                      {!sending && footerRunNotices ? (
+                      {!runActive && footerRunNotices ? (
                         footerRunTrace ? (
                           <RunProcess
                             trace={footerRunTrace}
@@ -2316,7 +2869,7 @@ export function ChatScreen({ navigation, route }: Props) {
                 onContentSizeChange={() => {
                   if (
                     transcriptMessages.length ||
-                    sending ||
+                    runActive ||
                     pendingRequests.length ||
                     footerRunNotices
                   ) {
@@ -2431,7 +2984,7 @@ export function ChatScreen({ navigation, route }: Props) {
                 runningSubmitModes={["steer", "queue"]}
                 sendDisabled={!canSend}
                 sendLabel={t("发送消息")}
-                sending={sending}
+                sending={runActive}
                 showStop={Boolean(activeRunId)}
                 steerDisabled={Boolean(pendingAttachments.length)}
                 steerLabel={t("引导")}

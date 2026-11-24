@@ -92,7 +92,8 @@ export interface SessionStopRunResult {
 
 export interface SessionWatchEventsParams {
   sessionId: string;
-  cursor?: string | null;
+  /** Protocol sequence to resume after; the node replays everything newer. */
+  cursor?: number | null;
 }
 
 export interface SessionUnwatchEventsParams {

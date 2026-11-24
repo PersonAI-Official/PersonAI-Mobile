@@ -1239,3 +1239,53 @@ export async function sendChatMessageStream(
 export function sessionRpcFor(tunnel: SecureTunnel): SessionRpc {
   return new SessionRpc(tunnel);
 }
+
+export interface WatchChatEventsParams {
+  /** Business calls only need the tunnel; the generic method scopes by session. */
+  tunnel: SecureTunnel;
+  sessionCode: string;
+  signal?: AbortSignal;
+  /**
+   * `tailOnly` asks the node for events recorded after the subscription opened
+   * and skips the retained replay. The screen already reads the filtered replay
+   * through `tron.chat.protocolEvents`, and the unfiltered one is capped at
+   * several megabytes on a long session: replaying it twice over the tunnel
+   * would delay the live tail it exists to deliver.
+   */
+  tailOnly?: boolean;
+  /** One AG-UI event of this session, live. */
+  onEvent?: (event: AgUiEvent) => void;
+}
+
+/**
+ * `session.watchEvents` — the session's AG-UI event source, until the caller
+ * aborts. A chat screen uses it to follow a run it did not start itself, so
+ * re-opening a running session keeps updating instead of freezing on the last
+ * persisted message.
+ */
+export async function watchChatEvents(
+  params: WatchChatEventsParams,
+): Promise<void> {
+  if (params.signal?.aborted) return;
+  const rpc = new SessionRpc(params.tunnel);
+  const stream = rpc.watchEvents(
+    {
+      sessionId: params.sessionCode,
+      // Sequences grow monotonically, so the largest safe integer is a cursor
+      // nothing in the retained replay can be newer than.
+      ...(params.tailOnly ? { cursor: Number.MAX_SAFE_INTEGER } : {}),
+    },
+    { signal: params.signal },
+  );
+  // `rpc_result` carries the subscription id and only settles when the
+  // subscription ends; cancelling the stream is what releases it here.
+  void stream.subscriptionId.catch(() => undefined);
+  try {
+    for await (const event of stream.events) {
+      if (params.signal?.aborted) break;
+      params.onEvent?.(event);
+    }
+  } finally {
+    stream.cancel();
+  }
+}

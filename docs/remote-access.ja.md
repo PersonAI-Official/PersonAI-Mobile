@@ -90,6 +90,8 @@ tron.skins.active
 - `rpc_event.data` は AG-UI イベントそのものです。名前を変えたり、別のイベント語彙で包んだりしません。
 - `session.watchEvents` は購読、履歴 replay、ライブイベントの順で流れます。クライアントは `seq` で重複排除します。
 - ストリーミング呼び出しは `rpc_result` の後に `rpc_end` で終了します。未知のイベントは無視し、致命的なプロトコル変更とは扱いません。
+- まだ実行中のセッションを再び開いても、画面は run を開始したクライアントに依存しません。`tron.chat.protocolEvents` で終端イベントのない run を特定し、`session.watchEvents`（`tailOnly`、巨大な全量 replay をスキップ）でライブイベントに追随します。イベントバスを持たない商品は 2.5s ごとに replay を読み直します。AG-UI カード（ツールトレイル、A2UI surface）は replay と `tron.chat.a2uiState` から復元します。
+- `tron.chat.answerUserInput` と `tron.chat.a2uiAction` は one-shot です。ノードは再開後の実行全体を集め終えてから応答します。そのためスマホは送信の瞬間に `session.watchEvents` を購読してその再開を追跡します（runCode を流用する場合も、新しく採番する場合もあります）。one-shot のタイムアウトは「このクライアントが待つのをやめた」意味で、回答が不採用になった意味ではありません。
 
 ## LAN / インターネットの経路選択
 

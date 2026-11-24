@@ -90,6 +90,8 @@ Rules:
 - `rpc_event.data` is an AG-UI event verbatim; it is never renamed or wrapped in a second event vocabulary.
 - `session.watchEvents` subscribes first, replays history, then follows live events; clients deduplicate by `seq`.
 - Streaming calls end with `rpc_end` after `rpc_result`; unknown events are ignored rather than treated as a fatal protocol change.
+- Re-entering a session that is still running does not depend on the client that started the run: the chat screen reads `tron.chat.protocolEvents` to find the run with no terminal event, then follows it through `session.watchEvents` (`tailOnly`, skipping the multi-megabyte full replay), and falls back to a 2.5s replay re-read when the product has no event bus. AG-UI cards (tool rail, A2UI surfaces) are rebuilt from that replay plus `tron.chat.a2uiState`.
+- `tron.chat.answerUserInput` and `tron.chat.a2uiAction` are one-shot: the node collects the entire resumed run before it answers. The phone therefore subscribes to `session.watchEvents` at submit time and follows that continuation (which may reuse the paused `runCode` or mint a new one); a timeout on the one-shot call means this client stopped waiting, not that the answer was rejected.
 
 ## LAN / public endpoint selection
 

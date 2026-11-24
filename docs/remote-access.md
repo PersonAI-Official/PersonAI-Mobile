@@ -91,6 +91,8 @@ tron.skins.active
 - `rpc_event.data` 直接是 AG-UI 事件，不重命名、不再包一层自定义事件。
 - `session.watchEvents` 先订阅、再 replay、最后接实时事件；客户端按 `seq` 去重。
 - 流式调用在 `rpc_result` 后以 `rpc_end` 结束；客户端只忽略未知事件，不因为新事件类型断开。
+- 聊天页重新进入一个仍在运行的会话时，不依赖发起这次 run 的那个客户端：先用 `tron.chat.protocolEvents` 判断最后一次 run 没有终态事件，再用 `session.watchEvents`（`tailOnly`，跳过体积巨大的整段 replay）接上实时事件；产品没有事件总线时退化为按 2.5s 重读 replay。AG-UI 卡片（工具轨、A2UI surface）由 replay 与 `tron.chat.a2uiState` 重建。
+- `tron.chat.answerUserInput` 与 `tron.chat.a2uiAction` 是一次性调用：节点收集完恢复后的整段执行才返回。所以手机在提交的瞬间就订阅 `session.watchEvents` 接管这次恢复（恢复可能沿用原 runCode，也可能换新），进度来自事件流；该调用超时或断开只当作"客户端停止等待"，不视为回答未被接受。
 
 ## 局域网 / 公网选路
 
