@@ -115,6 +115,7 @@ export const enMessages: Record<string, string> = {
   "新会话": "New session",
   "新建随聊": "New chat",
   "无法加载节点数据": "Could not load node data",
+  "加载更多会话": "Load more sessions",
   "无法连接电脑，请确认地址正确、电脑在线且与手机在同一网络":
     "Cannot reach the computer. Check the address, make sure it is on, and use the same network as the phone.",
   "无法连接这台电脑，已清空当前会话内容。请确认电脑端 Tron 在运行，并检查网络与节点地址。":

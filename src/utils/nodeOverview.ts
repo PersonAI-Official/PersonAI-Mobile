@@ -5,6 +5,7 @@ import {
   listNavigationMenus,
   listProjects,
   listSessionGroups,
+  listSessionGroupsPage,
   listWorkspaceOptions,
   type ChatSession,
   type DirectoryRecord,
@@ -25,6 +26,7 @@ export interface NodeWorkspaceOverview {
   name: string;
   status: string;
   sessions: ChatSession[];
+  nextCursor: string | null;
   projects: ProjectRecord[];
   directories: DirectoryRecord[];
 }
@@ -89,6 +91,7 @@ function workspaceView(
   sessions: ChatSession[],
   projects: ProjectRecord[],
   directories: DirectoryRecord[],
+  nextCursor: string | null,
 ): NodeWorkspaceOverview {
   return {
     workspaceCode: workspace.workspaceCode,
@@ -96,6 +99,7 @@ function workspaceView(
     name: workspace.name?.trim() || workspace.workspaceCode,
     status: workspace.status,
     sessions,
+    nextCursor,
     projects,
     directories,
   };
@@ -147,10 +151,10 @@ export async function loadNodeOverview(
         WORKSPACE_FETCH_CONCURRENCY,
         async (workspace): Promise<NodeWorkspaceOverview> => {
           const [sessionGroups, projects, directories] = await Promise.all([
-            listSessionGroups({
-              tunnel,
-              workspaceCode: workspace.workspaceCode,
-            }),
+            includeCatalog
+              ? listSessionGroupsPage({ tunnel, workspaceCode: workspace.workspaceCode })
+              : listSessionGroups({ tunnel, workspaceCode: workspace.workspaceCode })
+                  .then((groups) => ({ groups, nextCursor: null })),
             includeCatalog
               ? listProjects({
                   tunnel,
@@ -167,10 +171,11 @@ export async function loadNodeOverview(
           return workspaceView(
             workspace,
             uniqueSessions(
-              sessionGroups.flatMap((group) => group.sessions ?? []),
+              sessionGroups.groups.flatMap((group) => group.sessions ?? []),
             ),
             projects,
             directories,
+            sessionGroups.nextCursor,
           );
         },
       ),

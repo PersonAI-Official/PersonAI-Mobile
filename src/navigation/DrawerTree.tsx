@@ -37,6 +37,7 @@ import {
   type NodeOverview,
 } from "../utils/nodeOverview";
 import type { ChatDraft } from "./types";
+import { listSessionGroupsPage } from "../api/tron";
 
 interface DrawerTreeProps {
   /** Refresh expanded nodes whenever the drawer is opened. */
@@ -98,6 +99,9 @@ type NodeTreeState =
   | {
       status: "ready";
       workspaces: TreeWorkspace[];
+      overview: NodeOverview;
+      paging?: string;
+      pageError?: string;
     };
 
 function sortByUpdatedDesc(left: TreeSession, right: TreeSession): number {
@@ -305,6 +309,7 @@ export function DrawerTree({
           [node.id]: {
             status: "ready",
             workspaces: buildNodeWorkspaces(node, overview, menus),
+            overview,
           },
         }));
       } catch (error) {
@@ -319,6 +324,36 @@ export function DrawerTree({
     },
     [fallbackMenus, requestForNode],
   );
+
+  const loadMore = async (node: SavedNode, snapshot: Extract<NodeTreeState, { status: "ready" }>, code: string) => {
+    const workspace = snapshot.overview.workspaces.find((item) => item.workspaceCode === code);
+    if (!workspace?.nextCursor || snapshot.paging) return;
+    const loading = { ...snapshot, paging: code, pageError: undefined };
+    setNodeStates((previous) => ({ ...previous, [node.id]: loading }));
+    try {
+      const page = await requestForNode(node, ({ tunnel }) =>
+        listSessionGroupsPage({ tunnel, workspaceCode: code, cursor: workspace.nextCursor }),
+      );
+      const sessions = new Map(workspace.sessions.map((session) => [session.sessionCode, session]));
+      for (const group of page.groups) {
+        for (const session of group.sessions) sessions.set(session.sessionCode, session);
+      }
+      const overview = {
+        ...snapshot.overview,
+        workspaces: snapshot.overview.workspaces.map((item) => item === workspace
+          ? { ...item, sessions: [...sessions.values()], nextCursor: page.nextCursor }
+          : item),
+      };
+      const menus = overview.menus.length ? overview.menus : fallbackMenus;
+      setNodeStates((previous) => previous[node.id] === loading ? {
+        ...previous, [node.id]: { status: "ready", overview, workspaces: buildNodeWorkspaces(node, overview, menus) },
+      } : previous);
+    } catch (error) {
+      setNodeStates((previous) => previous[node.id] === loading ? {
+        ...previous, [node.id]: { ...snapshot, pageError: describeError(error) },
+      } : previous);
+    }
+  };
 
   /**
    * Opens a local draft on the tapped node. The node stays untouched until the
@@ -748,6 +783,17 @@ export function DrawerTree({
                               renderMenuGroup(workspace, group),
                             )
                           )}
+                          {state?.status === "ready" && state.overview.workspaces.some((item) =>
+                            item.workspaceCode === workspace.workspaceCode && item.nextCursor,
+                          ) ? (
+                            <Pressable accessibilityRole="button" disabled={Boolean(state.paging)}
+                              onPress={() => void loadMore(node, state, workspace.workspaceCode)}>
+                              <Text style={styles.retryText}>{t("加载更多会话")}</Text>
+                            </Pressable>
+                          ) : null}
+                          {state?.status === "ready" && state.pageError ? (
+                            <Text style={styles.errorText}>{state.pageError}</Text>
+                          ) : null}
                         </View>
                       ) : null}
                     </View>

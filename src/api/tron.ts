@@ -735,18 +735,35 @@ export async function listDirectories(
 }
 
 /** `tron.session.groups` — Tron's topic/directory/chats grouping. */
-export async function listSessionGroups(
-  params: ApiParams & { workspaceCode: string },
-): Promise<ChatSessionGroup[]> {
+export async function listSessionGroupsPage(
+  params: ApiParams & { workspaceCode: string; cursor?: string | null },
+): Promise<{ groups: ChatSessionGroup[]; nextCursor: string | null }> {
   const data = await callTron<unknown>(
     params,
     TRON_RPC_METHODS.sessionGroups,
-    { workspaceCode: params.workspaceCode },
+    { workspaceCode: params.workspaceCode, cursor: params.cursor ?? null, limit: 50 },
   );
-  if (!Array.isArray(data)) return [];
-  return data
+  const records = Array.isArray(data) ? data : isRecord(data) ? data.groups : null;
+  const groups = (Array.isArray(records) ? records : [])
     .map((entry) => normalizeGroup(entry))
     .filter((entry): entry is ChatSessionGroup => entry !== null);
+  return {
+    groups,
+    nextCursor: isRecord(data) && typeof data.nextCursor === "string" ? data.nextCursor : null,
+  };
+}
+
+export async function listSessionGroups(
+  params: ApiParams & { workspaceCode: string },
+): Promise<ChatSessionGroup[]> {
+  const groups: ChatSessionGroup[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await listSessionGroupsPage({ ...params, cursor });
+    groups.push(...page.groups);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return groups;
 }
 
 /** `tron.chat.protocolEvents` — replay of AG-UI events for one session. */
